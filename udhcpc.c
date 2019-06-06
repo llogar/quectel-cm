@@ -14,14 +14,14 @@ static int ql_system(const char *shell_cmd) {
     return ret;
 }
 
-static void ql_set_mtu(const char *usbnet_adapter, int ifru_mtu) {
+static void ql_set_mtu(const char *ifname, int ifru_mtu) {
     int inet_sock;
     struct ifreq ifr;
 
     inet_sock = socket(AF_INET, SOCK_DGRAM, 0);
 
     if (inet_sock > 0) {
-        strcpy(ifr.ifr_name, usbnet_adapter);
+        strcpy(ifr.ifr_name, ifname);
 
         if (!ioctl(inet_sock, SIOCGIFMTU, &ifr)) {
             if (ifr.ifr_ifru.ifru_mtu != ifru_mtu) {
@@ -58,7 +58,8 @@ static void* udhcpc_thread_function(void* arg) {
     if (udhcpc_fp) {
         char buf[0xff];
 
-        while((fgets(buf, sizeof(buf), udhcpc_fp)) != NULL) {
+        buf[sizeof(buf)-1] = '\0';
+        while((fgets(buf, sizeof(buf)-1, udhcpc_fp)) != NULL) {
             if ((strlen(buf) > 1) && (buf[strlen(buf) - 1] == '\n'))
                 buf[strlen(buf) - 1] = '\0';
             dbg_time("%s", buf);
@@ -80,8 +81,12 @@ void udhcpc_start(PROFILE_T *profile) {
     char *ifname = profile->usbnet_adapter;
     char shell_cmd[128];
 
+    if (profile->qmapnet_adapter) {
+        ifname = profile->qmapnet_adapter;
+    }
+
     if (profile->rawIP && profile->ipv4.Address && profile->ipv4.Mtu) {
-        ql_set_mtu(profile->usbnet_adapter, (profile->ipv4.Mtu));
+        ql_set_mtu(ifname, (profile->ipv4.Mtu));
     }
 
 #ifdef ANDROID
@@ -91,25 +96,41 @@ void udhcpc_start(PROFILE_T *profile) {
         snprintf(shell_cmd, sizeof(shell_cmd), "/system/bin/netcfg %s dhcp", ifname);
         ql_system(shell_cmd);
     } else {
-        snprintf(shell_cmd, sizeof(shell_cmd), "/system/bin/dhcptool %s", ifname);
+//        snprintf(shell_cmd, sizeof(shell_cmd), "/system/bin/dhcptool %s", ifname);
+        unsigned char *r = (unsigned char *)&profile->ipv4.Address;
+        unsigned char *m = (unsigned char *)&profile->ipv4.SubnetMask;
+        
+        snprintf(shell_cmd, sizeof(shell_cmd), "/system/bin/ifconfig %s %d.%d.%d.%d netmask %d.%d.%d.%d",
+            ifname, r[3],r[2], r[1], r[0], m[3],m[2], m[1], m[0]);
         ql_system(shell_cmd);
+
+        android_property_set(ifname, "dns1", profile->ipv4.DnsPrimary);
+        android_property_set(ifname, "dns2", profile->ipv4.DnsSecondary);
     }
 
     android_property_set(ifname, "gw", profile->ipv4.Gateway);
     return;
 #endif
 
+    if (strcmp(ifname, profile->usbnet_adapter)) {
+        snprintf(shell_cmd, sizeof(shell_cmd) - 1, "ifconfig %s up", profile->usbnet_adapter);
+        ql_system(shell_cmd);
+    }
+
     snprintf(shell_cmd, sizeof(shell_cmd) - 1, "ifconfig %s up", ifname);
     ql_system(shell_cmd);
 
 #if 1 //for bridge mode, only one public IP, so donot run udhcpc to obtain
 {
-    const char *BRIDGE_MODE_FILE = "/sys/module/GobiNet/parameters/bridge_mode";
-    const char *BRIDGE_IPV4_FILE = "/sys/module/GobiNet/parameters/bridge_ipv4";
+     char BRIDGE_MODE_FILE[128];
+     char BRIDGE_IPV4_FILE[128];
 
     if (strncmp(qmichannel, "/dev/qcqmi", strlen("/dev/qcqmi"))) {
-        BRIDGE_MODE_FILE = "/sys/module/qmi_wwan/parameters/bridge_mode";
-        BRIDGE_IPV4_FILE = "/sys/module/qmi_wwan/parameters/bridge_ipv4";
+        strcpy(BRIDGE_MODE_FILE , "/sys/module/qmi_wwan/parameters/bridge_mode");
+        strcpy(BRIDGE_IPV4_FILE, "/sys/module/qmi_wwan/parameters/bridge_ipv4");
+    } else {
+        snprintf(BRIDGE_MODE_FILE, sizeof(BRIDGE_MODE_FILE), "/sys/class/net/%s/bridge_mode", ifname);
+        snprintf(BRIDGE_IPV4_FILE, sizeof(BRIDGE_IPV4_FILE), "/sys/class/net/%s/bridge_ipv4", ifname);
     }
 
     if (profile->ipv4.Address && !access(BRIDGE_MODE_FILE, R_OK)) {
@@ -208,6 +229,18 @@ void udhcpc_start(PROFILE_T *profile) {
             snprintf(udhcpc_cmd, sizeof(udhcpc_cmd), "busybox udhcpc -f -n -q -t 5 -i %s", ifname);
 #endif
 
+#if 1 //for OpenWrt
+            if (!access("/lib/netifd/dhcp.script", X_OK) && !access("/sbin/ifup", X_OK) && !access("/sbin/ifstatus", X_OK)) {
+                dbg_time("you are use OpenWrt?");
+                dbg_time("should not calling udhcpc manually?");
+                dbg_time("should modify /etc/config/network as below?");
+                dbg_time("config interface wan");
+                dbg_time("\toption ifname	%s", ifname);
+                dbg_time("\toption proto	dhcp");
+                dbg_time("should use \"/sbin/ifstaus wan\" to check %s 's status?", ifname);
+            }
+#endif
+
             pthread_create(&udhcpc_thread_id, &udhcpc_thread_attr, udhcpc_thread_function, (void*)strdup(udhcpc_cmd));
             sleep(1);
         }
@@ -248,6 +281,11 @@ void udhcpc_start(PROFILE_T *profile) {
 void udhcpc_stop(PROFILE_T *profile) {
     char *ifname = profile->usbnet_adapter;
     char shell_cmd[128];
+    char reset_ip[128];
+
+    if (profile->qmapnet_adapter) {
+        ifname = profile->qmapnet_adapter;
+    }
 
 #ifdef ANDROID
     if(!access("/system/bin/netcfg", F_OK)) {
@@ -269,4 +307,6 @@ void udhcpc_stop(PROFILE_T *profile) {
     snprintf(shell_cmd, sizeof(shell_cmd) - 1, "ifconfig %s down", ifname);
 #endif
     ql_system(shell_cmd);
+    snprintf(reset_ip, sizeof(reset_ip) - 1, "ifconfig %s 0.0.0.0", ifname);
+    ql_system(reset_ip);
 }

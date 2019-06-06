@@ -120,15 +120,34 @@ typedef struct _QMIWDS_ADMIN_SET_DATA_FORMAT_TLV
    ULONG  Value;
 } __attribute__ ((packed)) QMIWDS_ADMIN_SET_DATA_FORMAT_TLV, *PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV;
 
-#if 0
 typedef struct _QMIWDS_ENDPOINT_TLV
 {
    UCHAR  TLVType;
    USHORT TLVLength;
    ULONG  ep_type;
    ULONG  iface_id;
-} QMIWDS_ENDPOINT_TLV, *PQMIWDS_ENDPOINT_TLV;
+} __attribute__ ((packed)) QMIWDS_ENDPOINT_TLV, *PQMIWDS_ENDPOINT_TLV;
 
+
+typedef struct _QMIWDS_ADMIN_SET_DATA_FORMAT_REQ_MSG
+{
+   USHORT Type;
+   USHORT Length;
+    QMIWDS_ADMIN_SET_DATA_FORMAT_TLV_QOS QosDataFormatTlv;
+    QMIWDS_ADMIN_SET_DATA_FORMAT_TLV UnderlyingLinkLayerProtocolTlv;
+    QMIWDS_ADMIN_SET_DATA_FORMAT_TLV UplinkDataAggregationProtocolTlv;
+    QMIWDS_ADMIN_SET_DATA_FORMAT_TLV DownlinkDataAggregationProtocolTlv;
+    QMIWDS_ADMIN_SET_DATA_FORMAT_TLV DownlinkDataAggregationMaxDatagramsTlv;
+    QMIWDS_ADMIN_SET_DATA_FORMAT_TLV DownlinkDataAggregationMaxSizeTlv;
+#if 0
+    QMIWDS_ADMIN_SET_DATA_FORMAT_TLV UplinkDataAggregationMaxDatagramsTlv;
+    QMIWDS_ADMIN_SET_DATA_FORMAT_TLV UplinkDataAggregationMaxSizeTlv;
+#else
+    QMIWDS_ENDPOINT_TLV epTlv;
+#endif
+} __attribute__ ((packed)) QMIWDS_ADMIN_SET_DATA_FORMAT_REQ_MSG, *PQMIWDS_ADMIN_SET_DATA_FORMAT_REQ_MSG;
+
+#if 0
 typedef enum _QMI_RETURN_CODES {
    QMI_SUCCESS = 0,
    QMI_SUCCESS_NOT_COMPLETE,
@@ -3291,6 +3310,8 @@ typedef struct _QMUX_MSG
 #endif
       QMIUIM_READ_TRANSPARENT_REQ_MSG           UIMUIMReadTransparentReq;
       QMIUIM_READ_TRANSPARENT_RESP_MSG          UIMUIMReadTransparentResp;
+
+      QMIWDS_ADMIN_SET_DATA_FORMAT_REQ_MSG      SetDataFormatReq;
 
    };
 } __attribute__ ((packed)) QMUX_MSG, *PQMUX_MSG;

@@ -262,7 +262,7 @@ static int is_brother_process(const char *dir, const char *file, void *argv[])
 #endif
 
     pid = atoi(file);
-    if (pid == getpid())
+    if (pid >= getpid())
         return 0;
 
     snprintf(linkname, MAX_PATH, "%s/%s/fd", dir, file);
@@ -297,7 +297,7 @@ static int kill_brothers(const char *qmichannel)
     myself[filenamesize] = 0;
 
     if (ls_dir("/proc", is_brother_process, argv))
-		sleep(1);
+        sleep(1);
 
 	return 0;
 }
@@ -376,6 +376,7 @@ static int get_dev_major_minor(char* path, int *major, int *minor)
 	*minor = atoi(devminor);
 	return 0;
 }
+
 static int qmidevice_detect(char **pp_qmichannel, char **pp_usbnet_adapter) {
     struct dirent* ent = NULL;
     DIR *pDir;
@@ -576,6 +577,7 @@ int main(int argc, char *argv[])
     UCHAR PSAttachedState;
     UCHAR  IPv4ConnectionStatus = 0xff; //unknow state
     UCHAR  IPV6ConnectionStatus = 0xff; //unknow state
+    int qmierr = 0;
     char * save_usbnet_adapter = NULL;
     PROFILE_T profile;
 #ifdef CONFIG_RESET_RADIO
@@ -653,13 +655,21 @@ int main(int argc, char *argv[])
                 profile.IsDualIPSupported |= (1 << IpFamilyV6); //support ipv4&ipv6
             break;
 
+            case 'd':
+                if (has_more_argv()) {
+                    profile.qmichannel = argv[opt++];
+                    if (!strncmp(profile.qmichannel, "/dev/mhi_QMI", strlen("/dev/mhi_QMI")))
+                        profile.usbnet_adapter = "rmnet_mhi0";
+                }
+            break;
+
             default:
                 return usage(argv[0]);
             break;
         }
     }
 
-    dbg_time("WCDMA&LTE_QConnectManager_Linux&Android_V1.1.34");
+    dbg_time("WCDMA&LTE_QConnectManager_Linux&Android_V1.1.45");
     dbg_time("%s profile[%d] = %s/%s/%s/%d, pincode = %s", argv[0], profile.pdp, profile.apn, profile.user, profile.password, profile.auth, profile.pincode);
 
     signal(SIGUSR1, ql_sigaction);
@@ -705,6 +715,53 @@ __main_loop:
         return -ENODEV;
     }
 
+    if (!strncmp(profile.qmichannel, "/dev/qcqmi", strlen("/dev/qcqmi"))) {
+        char MODE_FILE[128];
+        int mode_fd;
+
+        snprintf(MODE_FILE, sizeof(MODE_FILE), "/sys/class/net/%s/qmap_mode", profile.usbnet_adapter);        
+        mode_fd = open(MODE_FILE, O_RDONLY);
+
+        if (mode_fd > 0) {
+            char qmap_mode[2] = {0, 0};
+            read(mode_fd, &qmap_mode, sizeof(qmap_mode));
+            close(mode_fd);
+            profile.qmap_mode = qmap_mode[0] - '0';
+        }
+
+        if (profile.qmap_mode) {
+            char qmapnet_adapter[128];
+
+            sprintf(qmapnet_adapter, "/sys/class/net/%s.%d", profile.usbnet_adapter, profile.pdp);
+            if (!access(qmapnet_adapter, R_OK)) {
+                static char netcard[32] = "\0";
+
+                sprintf(netcard, "%s.%d", profile.usbnet_adapter, profile.pdp);
+                profile.qmapnet_adapter = netcard;
+            } else {
+                 profile.qmapnet_adapter = profile.usbnet_adapter;
+            }
+            dbg_time("Find qmapnet_adapter = %s", profile.qmapnet_adapter);
+       }
+    } else if(!strncmp(profile.qmichannel, "/dev/cdc-wdm", strlen("/dev/cdc-wdm"))) {
+        if (!access("/sys/module/qmi_wwan/parameters/rx_qmap", R_OK)) {
+            char qmapnet_adapter[128];
+
+            sprintf(qmapnet_adapter, "/sys/class/net/%s.%d", profile.usbnet_adapter, profile.pdp);
+            if (!access(qmapnet_adapter, R_OK)) {
+                static char netcard[32] = "\0";
+
+                sprintf(netcard, "%s.%d", profile.usbnet_adapter, profile.pdp);
+                profile.qmapnet_adapter = netcard;
+            } else {
+                 profile.qmapnet_adapter = profile.usbnet_adapter;
+            }
+            dbg_time("Find qmapnet_adapter = %s", profile.qmapnet_adapter);
+        }
+    } else if (!strncmp(profile.qmichannel, "/dev/mhi_QMI", strlen("/dev/mhi_QMI"))) {
+        profile.qmapnet_adapter = profile.usbnet_adapter;
+    }
+
     if (access(profile.qmichannel, R_OK | W_OK)) {
         dbg_time("Fail to access %s, errno: %d (%s)", profile.qmichannel, errno, strerror(errno));
         return errno;
@@ -718,7 +775,8 @@ __main_loop:
 }
 #endif
 
-    kill_brothers(profile.qmichannel);
+    if (profile.qmapnet_adapter == NULL || profile.qmapnet_adapter == profile.usbnet_adapter)
+        kill_brothers(profile.qmichannel);
 
     qmichannel = profile.qmichannel;
     if (!strncmp(profile.qmichannel, "/dev/qcqmi", strlen("/dev/qcqmi")))
@@ -731,7 +789,7 @@ __main_loop:
     }
     else
     {
-        if (pthread_create( &gQmiThreadID, 0, QmiWwanThread, (void *)profile.qmichannel) != 0)
+        if (pthread_create( &gQmiThreadID, 0, QmiWwanThread, (void *)&profile) != 0)
         {
             dbg_time("%s Failed to create QmiWwanThread: %d (%s)", __func__, errno, strerror(errno));
             return 0;
@@ -744,7 +802,8 @@ __main_loop:
         return 0;
     }
 
-    if (!strncmp(profile.qmichannel, "/dev/cdc-wdm", strlen("/dev/cdc-wdm"))) {
+    if (!strncmp(profile.qmichannel, "/dev/cdc-wdm", strlen("/dev/cdc-wdm"))
+        || !strncmp(profile.qmichannel, "/dev/mhi_QMI", strlen("/dev/mhi_QMI"))) {
         if (QmiWwanInit(&profile)) {
             dbg_time("%s Failed to QmiWwanInit: %d (%s)", __func__, errno, strerror(errno));
             return 0;
@@ -773,7 +832,11 @@ __main_loop:
     }
 #endif
 #ifdef CONFIG_SIM
-    requestGetSIMStatus(&SIMStatus);
+    qmierr = requestGetSIMStatus(&SIMStatus);
+    while (qmierr == QMI_ERR_OP_DEVICE_UNSUPPORTED) {
+        sleep(1);
+        qmierr = requestGetSIMStatus(&SIMStatus);
+    }
     if ((SIMStatus == SIM_PIN) && profile.pincode) {
         requestEnterSimPin(profile.pincode);
     }
@@ -855,29 +918,43 @@ __main_loop:
                             {
                                 usbnet_link_change(0, &profile);
                                 requestRegistrationState(&PSAttachedState);
-                                if (PSAttachedState == 1 && requestSetupDataCall(&profile, IpFamilyV4) == 0)
-                                {
+                                
+                                if (PSAttachedState == 1) {
+                                    qmierr = requestSetupDataCall(&profile, IpFamilyV4);
+
+                                    if ((qmierr > 0) && profile.user && profile.user[0] && profile.password && profile.password[0]) {
+                                        int old_auto =  profile.auth;
+
+                                        //may be fail because wrong auth mode, try pap->chap, or chap->pap
+                                        profile.auth = (profile.auth == 1) ? 2 : 1;
+                                        qmierr = requestSetupDataCall(&profile, IpFamilyV4);
+
+                                        if (qmierr)
+                                            profile.auth = old_auto; //still fail, restore old auth moe
+                                    }
+
                                     //succssful setup data call
-                                    if (profile.IsDualIPSupported) {
+                                    if (!qmierr && profile.IsDualIPSupported) {
                                         requestSetupDataCall(&profile, IpFamilyV6);
                                     }
+
+                                    if (!qmierr)
+                                        continue;
                                 }
-                                else
-                                {
+                                
 #ifdef CONFIG_EXIT_WHEN_DIAL_FAILED
-                                    kill(getpid(), SIGTERM);
+                                kill(getpid(), SIGTERM);
 #endif
 #ifdef CONFIG_RESET_RADIO
-                                    gettimeofday(&nowTime, (struct timezone *) NULL);
-                                    if (abs(nowTime.tv_sec - resetRadioTime.tv_sec) > CONFIG_RESET_RADIO) {
-                                        resetRadioTime = nowTime;
-                                        //requestSetOperatingMode(0x06); //same as AT+CFUN=0
-                                        requestSetOperatingMode(0x01); //same as AT+CFUN=4
-                                        requestSetOperatingMode(0x00); //same as AT+CFUN=1
-                                    }
-#endif
-                                    alarm(5); //try to setup data call 5 seconds later
+                                gettimeofday(&nowTime, (struct timezone *) NULL);
+                                if (abs(nowTime.tv_sec - resetRadioTime.tv_sec) > CONFIG_RESET_RADIO) {
+                                    resetRadioTime = nowTime;
+                                    //requestSetOperatingMode(0x06); //same as AT+CFUN=0
+                                    requestSetOperatingMode(0x01); //same as AT+CFUN=4
+                                    requestSetOperatingMode(0x00); //same as AT+CFUN=1
                                 }
+#endif
+                                alarm(5); //try to setup data call 5 seconds later
                             }
                         break;
 
@@ -909,7 +986,8 @@ __main_loop:
                                     requestDeactivateDefaultPDP(&profile, IpFamilyV6);
                            }
                             usbnet_link_change(0, &profile);
-                            if (!strncmp(profile.qmichannel, "/dev/cdc-wdm", strlen("/dev/cdc-wdm")))
+                            if (!strncmp(profile.qmichannel, "/dev/cdc-wdm", strlen("/dev/cdc-wdm"))
+                                || !strncmp(profile.qmichannel, "/dev/mhi_QMI", strlen("/dev/mhi_QMI")))
                                 QmiWwanDeInit();
                             main_send_event_to_qmidevice(RIL_REQUEST_QUIT);
                             goto __main_quit;
@@ -946,23 +1024,25 @@ __main_loop:
 
                         case RIL_UNSOL_DATA_CALL_LIST_CHANGED:
                         {
-                            #if defined(ANDROID) || defined(LINUX_RIL_SHLIB)
                             UCHAR oldConnectionStatus = IPv4ConnectionStatus;
-                            #endif
                             requestQueryDataCall(&IPv4ConnectionStatus, IpFamilyV4);
                             if (profile.IsDualIPSupported)
                                 requestQueryDataCall(&IPV6ConnectionStatus, IpFamilyV6);
                             if (QWDS_PKT_DATA_CONNECTED != IPv4ConnectionStatus)
                             {
                                 usbnet_link_change(0, &profile);
-                                #if defined(ANDROID) || defined(LINUX_RIL_SHLIB)
-                                if (oldConnectionStatus == QWDS_PKT_DATA_CONNECTED) //connected change to disconnect
+                                if (oldConnectionStatus == QWDS_PKT_DATA_CONNECTED){ //connected change to disconnect
+#if defined(ANDROID) || defined(LINUX_RIL_SHLIB)
                                     kill(getpid(), SIGTERM); //android will setup data call again
-                                #else
-                                send_signo_to_main(SIGUSR1);
-                                #endif
+#else
+                                    send_signo_to_main(SIGUSR1);
+#endif
+                                }
                             } else if (QWDS_PKT_DATA_CONNECTED == IPv4ConnectionStatus) {
                                 usbnet_link_change(1, &profile);
+                                if (oldConnectionStatus == QWDS_PKT_DATA_CONNECTED) { //receive two CONNECT IND?
+                                    send_signo_to_main(SIGUSR2);
+                                }
                             }
                         }
                         break;

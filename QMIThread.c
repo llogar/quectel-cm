@@ -1,6 +1,21 @@
 #include "QMIThread.h"
 extern char *strndup (const char *__string, size_t __n);
 
+#define qmi_rsp_check_and_return() do { \
+        if (err < 0 || pResponse == NULL) { \
+            dbg_time("%s err = %d", __func__, err); \
+            return err; \
+        } \
+        pMUXMsg = &pResponse->MUXMsg; \
+        if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) { \
+            USHORT QMUXError = le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError); \
+            dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__, \
+                le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), QMUXError); \
+            free(pResponse); \
+            return QMUXError; \
+        } \
+} while(0)
+
 int qmiclientId[QMUX_TYPE_WDS_ADMIN + 1]; //GobiNet use fd to indicate client ID, so type of qmiclientId must be int
 static uint32_t WdsConnectionIPv4Handle = 0;
 static uint32_t WdsConnectionIPv6Handle = 0;
@@ -163,7 +178,7 @@ static USHORT WdsStartNwInterfaceReq(PQMUX_MSG pMUXMsg, void *arg) {
     TLVLength +=(le16_to_cpu(pTechPref->TLVLength) + sizeof(QCQMICTL_TLV_HDR));
 
     // Set APN Name
-    if (profile->apn) {
+    if (profile->apn && !s_is_cdma) { //cdma no apn
         pApnName = (PQMIWDS_APNNAME)(pTLV + TLVLength);
         pApnName->TLVType = 0x14;
         pApnName->TLVLength = cpu_to_le16(strlen(profile->apn));
@@ -206,7 +221,7 @@ static USHORT WdsStartNwInterfaceReq(PQMUX_MSG pMUXMsg, void *arg) {
     TLVLength += (le16_to_cpu(pIpFamily->TLVLength) + sizeof(QCQMICTL_TLV_HDR));
 
     //Set Profile Index
-    if (profile->pdp && !s_is_cdma) { //cdma only allow one pdp
+    if (profile->pdp && !s_is_cdma) { //cdma only support one pdp, so no need to set profile index
         PQMIWDS_PROFILE_IDENTIFIER pProfileIndex = (PQMIWDS_PROFILE_IDENTIFIER)(pTLV + TLVLength);
         pProfileIndex->TLVLength = cpu_to_le16(0x01);
         pProfileIndex->TLVType = 0x31;
@@ -245,30 +260,99 @@ static USHORT WdsSetAutoConnect(PQMUX_MSG pMUXMsg, void *arg) {
     return sizeof(QMIWDS_SET_AUTO_CONNECT_REQ_MSG);
 }
 
+enum peripheral_ep_type {
+	DATA_EP_TYPE_RESERVED	= 0x0,
+	DATA_EP_TYPE_HSIC	= 0x1,
+	DATA_EP_TYPE_HSUSB	= 0x2,
+	DATA_EP_TYPE_PCIE	= 0x3,
+	DATA_EP_TYPE_EMBEDDED	= 0x4,
+	DATA_EP_TYPE_BAM_DMUX	= 0x5,
+};
+        
+typedef struct {
+   UINT rx_urb_size;
+   enum peripheral_ep_type ep_type;
+   UINT iface_id;
+   UCHAR MuxId;
+} QMAP_SETTING;
+static USHORT WdsSetQMUXBindMuxDataPort(PQMUX_MSG pMUXMsg, void *arg) {
+    QMAP_SETTING *qmap_settings = (QMAP_SETTING *)arg;
+
+    pMUXMsg->BindMuxDataPortReq.TLVType = 0x10;
+    pMUXMsg->BindMuxDataPortReq.TLVLength = cpu_to_le16(0x08);
+    pMUXMsg->BindMuxDataPortReq.ep_type = cpu_to_le32(qmap_settings->ep_type);
+    pMUXMsg->BindMuxDataPortReq.iface_id = cpu_to_le32(qmap_settings->iface_id);
+    pMUXMsg->BindMuxDataPortReq.TLV2Type = 0x11;
+    pMUXMsg->BindMuxDataPortReq.TLV2Length = cpu_to_le16(0x01);
+    pMUXMsg->BindMuxDataPortReq.MuxId = qmap_settings->MuxId;
+    pMUXMsg->BindMuxDataPortReq.TLV3Type = 0x13;
+    pMUXMsg->BindMuxDataPortReq.TLV3Length = cpu_to_le16(0x04);
+    pMUXMsg->BindMuxDataPortReq.client_type = cpu_to_le32(1); //WDS_CLIENT_TYPE_TETHERED
+    
+    return sizeof(QMIWDS_BIND_MUX_DATA_PORT_REQ_MSG);
+}
+
 static USHORT WdaSetDataFormat(PQMUX_MSG pMUXMsg, void *arg) {
-    PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV_QOS pWdsAdminQosTlv;
-    PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV linkProto;
-    PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV dlTlp;
+    QMAP_SETTING *qmap_settings = (QMAP_SETTING *)arg;
 
-    pWdsAdminQosTlv = (PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV_QOS)(&pMUXMsg->QMUXMsgHdr + 1);
-    pWdsAdminQosTlv->TLVType = 0x10;
-    pWdsAdminQosTlv->TLVLength = cpu_to_le16(0x0001);
-    pWdsAdminQosTlv->QOSSetting = 0; /* no-QOS header */
+    if (qmap_settings->rx_urb_size == 0) {
+        PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV_QOS pWdsAdminQosTlv;
+        PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV linkProto;
+        PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV dlTlp;
 
-    linkProto = (PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV)(pWdsAdminQosTlv + 1);
-    linkProto->TLVType = 0x11;
-    linkProto->TLVLength = cpu_to_le16(4);
-    linkProto->Value = cpu_to_le32(0x01);     /* Set Ethernet  mode */
+        pWdsAdminQosTlv = (PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV_QOS)(&pMUXMsg->QMUXMsgHdr + 1);
+        pWdsAdminQosTlv->TLVType = 0x10;
+        pWdsAdminQosTlv->TLVLength = cpu_to_le16(0x0001);
+        pWdsAdminQosTlv->QOSSetting = 0; /* no-QOS header */
 
-    dlTlp = (PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV)(linkProto + 1);;
-    dlTlp->TLVType = 0x13;
-    dlTlp->TLVLength = cpu_to_le16(4);
-    dlTlp->Value = cpu_to_le32(0x00);
+        linkProto = (PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV)(pWdsAdminQosTlv + 1);
+        linkProto->TLVType = 0x11;
+        linkProto->TLVLength = cpu_to_le16(4);
+        linkProto->Value = cpu_to_le32(0x01);     /* Set Ethernet  mode */
 
-    if (sizeof(*linkProto) != 7 )
-        dbg_time("%s sizeof(*linkProto) = %d, is not 7!", __func__, sizeof(*linkProto) );
+        dlTlp = (PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV)(linkProto + 1);;
+        dlTlp->TLVType = 0x13;
+        dlTlp->TLVLength = cpu_to_le16(4);
+        dlTlp->Value = cpu_to_le32(0x00);
 
-    return sizeof(QCQMUX_MSG_HDR) + sizeof(*pWdsAdminQosTlv) + sizeof(*linkProto) + sizeof(*dlTlp);
+        if (sizeof(*linkProto) != 7 )
+            dbg_time("%s sizeof(*linkProto) = %d, is not 7!", __func__, sizeof(*linkProto) );
+
+        return sizeof(QCQMUX_MSG_HDR) + sizeof(*pWdsAdminQosTlv) + sizeof(*linkProto) + sizeof(*dlTlp);
+    } 
+    else {
+    //Indicates whether the Quality of Service(QOS) data format is used by the client.
+        pMUXMsg->SetDataFormatReq.QosDataFormatTlv.TLVType = 0x10;
+        pMUXMsg->SetDataFormatReq.QosDataFormatTlv.TLVLength = cpu_to_le16(0x0001);
+        pMUXMsg->SetDataFormatReq.QosDataFormatTlv.QOSSetting = 0; /* no-QOS header */
+    //Underlying Link Layer Protocol
+        pMUXMsg->SetDataFormatReq.UnderlyingLinkLayerProtocolTlv.TLVType = 0x11; 
+        pMUXMsg->SetDataFormatReq.UnderlyingLinkLayerProtocolTlv.TLVLength = cpu_to_le16(4);
+        pMUXMsg->SetDataFormatReq.UnderlyingLinkLayerProtocolTlv.Value = cpu_to_le32(0x02);     /* Set IP  mode */
+    //Uplink (UL) data aggregation protocol to be used for uplink data transfer.
+        pMUXMsg->SetDataFormatReq.UplinkDataAggregationProtocolTlv.TLVType = 0x12; 
+        pMUXMsg->SetDataFormatReq.UplinkDataAggregationProtocolTlv.TLVLength = cpu_to_le16(4);
+        pMUXMsg->SetDataFormatReq.UplinkDataAggregationProtocolTlv.Value = cpu_to_le32(0x05); //UL QMAP is enabled
+    //Downlink (DL) data aggregation protocol to be used for downlink data transfer
+        pMUXMsg->SetDataFormatReq.DownlinkDataAggregationProtocolTlv.TLVType = 0x13; 
+        pMUXMsg->SetDataFormatReq.DownlinkDataAggregationProtocolTlv.TLVLength = cpu_to_le16(4);
+        pMUXMsg->SetDataFormatReq.DownlinkDataAggregationProtocolTlv.Value = cpu_to_le32(0x05); //UL QMAP is enabled
+    //Maximum number of datagrams in a single aggregated packet on downlink
+        pMUXMsg->SetDataFormatReq.DownlinkDataAggregationMaxDatagramsTlv.TLVType = 0x15; 
+        pMUXMsg->SetDataFormatReq.DownlinkDataAggregationMaxDatagramsTlv.TLVLength = cpu_to_le16(4);
+        pMUXMsg->SetDataFormatReq.DownlinkDataAggregationMaxDatagramsTlv.Value = cpu_to_le32(qmap_settings->rx_urb_size/512);
+    //Maximum size in bytes of a single aggregated packet allowed on downlink
+        pMUXMsg->SetDataFormatReq.DownlinkDataAggregationMaxSizeTlv.TLVType = 0x16; 
+        pMUXMsg->SetDataFormatReq.DownlinkDataAggregationMaxSizeTlv.TLVLength = cpu_to_le16(4);
+        pMUXMsg->SetDataFormatReq.DownlinkDataAggregationMaxSizeTlv.Value = cpu_to_le32(qmap_settings->rx_urb_size);
+    //Peripheral End Point ID
+        pMUXMsg->SetDataFormatReq.epTlv.TLVType = 0x17; 
+        pMUXMsg->SetDataFormatReq.epTlv.TLVLength = cpu_to_le16(8);
+        pMUXMsg->SetDataFormatReq.epTlv.ep_type = cpu_to_le32(qmap_settings->ep_type);
+        pMUXMsg->SetDataFormatReq.epTlv.iface_id = cpu_to_le32(qmap_settings->iface_id); 
+
+        return sizeof(QMIWDS_ADMIN_SET_DATA_FORMAT_REQ_MSG);
+    }
 }
 
 #ifdef CONFIG_SIM
@@ -326,7 +410,7 @@ static USHORT UimReadTransparentIMSIReqSend(PQMUX_MSG pMUXMsg, void *arg) {
 
     pMUXMsg->UIMUIMReadTransparentReq.TLV2Length = cpu_to_le16(3 +  pMUXMsg->UIMUIMReadTransparentReq.path_len);
 
-    pReadTransparent = (PREAD_TRANSPARENT_TLV)(&pMUXMsg->UIMUIMReadTransparentReq.path[0] + pMUXMsg->UIMUIMReadTransparentReq.path_len);
+    pReadTransparent = (PREAD_TRANSPARENT_TLV)(&pMUXMsg->UIMUIMReadTransparentReq.path[pMUXMsg->UIMUIMReadTransparentReq.path_len]);
     pReadTransparent->TLVType = 0x03;
     pReadTransparent->TLVLength = cpu_to_le16(0x04);
     pReadTransparent->Offset = cpu_to_le16(0x00);
@@ -369,7 +453,10 @@ static USHORT WdsModifyProfileSettingsReq(PQMUX_MSG pMUXMsg, void *arg) {
 // 1 ?C PDP-PPP
 // 2 ?C PDP-IPv6
 // 3 ?C PDP-IPv4v6
-    pPdpType->PdpType = 3;
+    if (profile->IsDualIPSupported)
+        pPdpType->PdpType = 3;
+    else
+        pPdpType->PdpType = 0;
     TLVLength +=(le16_to_cpu(pPdpType->TLVLength) + sizeof(QCQMICTL_TLV_HDR));
 
     // Set APN Name
@@ -534,52 +621,84 @@ void QmiThreadRecvQMI(PQCQMIMSG pResponse) {
 
 int requestSetEthMode(PROFILE_T *profile) {
     PQCQMIMSG pRequest;
-    PQCQMIMSG pResponse;
+    PQCQMIMSG pResponse = NULL;
     PQMUX_MSG pMUXMsg;
     int err;
     PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV linkProto;
+    UCHAR IpPreference;
     UCHAR autoconnect_setting = 0;
+    QMAP_SETTING qmap_settings = {0, 0, 0, 0};
 
-    if (profile->IsDualIPSupported) {
-        UCHAR IpPreference;
+    if (profile->qmapnet_adapter) {
+        profile->rawIP = 1;
+        s_9x07 = profile->rawIP;
+        qmap_settings.MuxId = (profile->qmapnet_adapter != profile->usbnet_adapter) ? (0x80 + profile->pdp) : 0x81;
 
-        IpPreference = IpFamilyV4;
-        pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS, QMIWDS_SET_CLIENT_IP_FAMILY_PREF_REQ, WdsSetClientIPFamilyPref, (void *)&IpPreference);
-        QmiThreadSendQMI(pRequest, &pResponse);
-        if (pResponse) free(pResponse);
+        if (!strncmp(profile->qmichannel, "/dev/mhi_QMI", strlen("/dev/mhi_QMI"))) { //SDX20_PCIE
+            qmap_settings.rx_urb_size = 16*1024; //must same as rx_urb_size defined in GobiNet&qmi_wwan driver
+            qmap_settings.ep_type = DATA_EP_TYPE_PCIE;
+            qmap_settings.iface_id = 0x04;
+        }
+        else { // for MDM9x07&MDM9x40&SDX20 USB
+            qmap_settings.rx_urb_size = 16*1024; //must same as rx_urb_size defined in GobiNet&qmi_wwan driver
+            qmap_settings.ep_type = DATA_EP_TYPE_HSUSB;
+            qmap_settings.iface_id = 0x04;
+        }
 
-        IpPreference = IpFamilyV6;
-        pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS_IPV6, QMIWDS_SET_CLIENT_IP_FAMILY_PREF_REQ, WdsSetClientIPFamilyPref, (void *)&IpPreference);
-        QmiThreadSendQMI(pRequest, &pResponse);
-        if (pResponse) free(pResponse);
+        if (!strncmp(qmichannel, "/dev/qcqmi", strlen("/dev/qcqmi"))) //GobiNet set data format in GobiNet driver
+            goto skip_WdaSetDataFormat;
+
+        if (profile->qmapnet_adapter != profile->usbnet_adapter) //QMAP MUX enabled, set data format in quectel-qmi-proxy
+            goto skip_WdaSetDataFormat;
     }
-    
-    pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS, QMIWDS_SET_AUTO_CONNECT_REQ , WdsSetAutoConnect, (void *)&autoconnect_setting);
-    QmiThreadSendQMI(pRequest, &pResponse);
-    if (pResponse) free(pResponse);
 
-    pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS_ADMIN, QMIWDS_ADMIN_SET_DATA_FORMAT_REQ, WdaSetDataFormat, NULL);
+    pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS_ADMIN, QMIWDS_ADMIN_SET_DATA_FORMAT_REQ, WdaSetDataFormat, (void *)&qmap_settings);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     linkProto = (PQMIWDS_ADMIN_SET_DATA_FORMAT_TLV)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x11);
     if (linkProto != NULL) {
         profile->rawIP = (le32_to_cpu(linkProto->Value) == 2);
         s_9x07 = profile->rawIP;
     }
-
     free(pResponse);
+
+skip_WdaSetDataFormat:
+    if (profile->qmapnet_adapter) {
+        // bind wds mux data port
+        pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS, QMIWDS_BIND_MUX_DATA_PORT_REQ , WdsSetQMUXBindMuxDataPort, (void *)&qmap_settings);
+        err = QmiThreadSendQMI(pRequest, &pResponse);
+        qmi_rsp_check_and_return();
+        if (pResponse) free(pResponse);
+    }
+
+    // set ipv4
+    IpPreference = IpFamilyV4;
+    pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS, QMIWDS_SET_CLIENT_IP_FAMILY_PREF_REQ, WdsSetClientIPFamilyPref, (void *)&IpPreference);
+    err = QmiThreadSendQMI(pRequest, &pResponse);
+    if (pResponse) free(pResponse);
+
+    if (profile->IsDualIPSupported) {
+        if (profile->qmapnet_adapter) {
+            // bind wds ipv6 mux data port
+            pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS_IPV6, QMIWDS_BIND_MUX_DATA_PORT_REQ , WdsSetQMUXBindMuxDataPort, (void *)&qmap_settings);
+            err = QmiThreadSendQMI(pRequest, &pResponse);
+            qmi_rsp_check_and_return();
+            if (pResponse) free(pResponse);
+        }
+
+        // set ipv6
+        IpPreference = IpFamilyV6;
+        pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS_IPV6, QMIWDS_SET_CLIENT_IP_FAMILY_PREF_REQ, WdsSetClientIPFamilyPref, (void *)&IpPreference);
+        err = QmiThreadSendQMI(pRequest, &pResponse);
+        qmi_rsp_check_and_return();
+        if (pResponse) free(pResponse);
+    }
+
+    pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS, QMIWDS_SET_AUTO_CONNECT_REQ , WdsSetAutoConnect, (void *)&autoconnect_setting);
+    QmiThreadSendQMI(pRequest, &pResponse);
+    if (pResponse) free(pResponse);
+
     return 0;
 }
 
@@ -597,18 +716,7 @@ int requestGetPINStatus(SIM_Status *pSIMStatus) {
     else
         pRequest = ComposeQMUXMsg(QMUX_TYPE_DMS, QMIDMS_UIM_GET_PIN_STATUS_REQ, NULL, NULL);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     pPin1Status = (PQMIDMS_UIM_PIN_STATUS)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x11);
     //pPin2Status = (PQMIDMS_UIM_PIN_STATUS)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x12);
@@ -641,29 +749,13 @@ int requestGetSIMStatus(SIM_Status *pSIMStatus) { //RIL_REQUEST_GET_SIM_STATUS
         "SIM_NETWORK_PERSONALIZATION"
     };
 
-__requestGetSIMStatus:
     if (s_9x07 && qmiclientId[QMUX_TYPE_UIM])
         pRequest = ComposeQMUXMsg(QMUX_TYPE_UIM, QMIUIM_GET_CARD_STATUS_REQ, NULL, NULL);
     else
         pRequest = ComposeQMUXMsg(QMUX_TYPE_DMS, QMIDMS_UIM_GET_STATE_REQ, NULL, NULL);
 
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        if (QMI_ERR_OP_DEVICE_UNSUPPORTED == le16_to_cpu(pResponse->MUXMsg.QMUXMsgHdrResp.QMUXError)) {
-            sleep(1);
-            goto __requestGetSIMStatus;
-        }
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     *pSIMStatus = SIM_ABSENT;
     if (s_9x07 && qmiclientId[QMUX_TYPE_UIM])
@@ -769,18 +861,7 @@ int requestEnterSimPin(const CHAR *pPinCode) {
     else
         pRequest = ComposeQMUXMsg(QMUX_TYPE_DMS, QMIDMS_UIM_VERIFY_PIN_REQ, DmsUIMVerifyPinReqSend, (void *)pPinCode);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     free(pResponse);
     return 0;
@@ -800,18 +881,7 @@ int requestGetICCID(void) { //RIL_REQUEST_GET_IMSI
     } else {
         return 0;
     }
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     pUimContent = (PQMIUIM_CONTENT)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x11);
     if (pUimContent != NULL) {
@@ -819,15 +889,10 @@ int requestGetICCID(void) { //RIL_REQUEST_GET_IMSI
         int i = 0, j = 0;
 
         for (i = 0, j = 0; i < le16_to_cpu(pUimContent->content_len); ++i) {
-            if  ((pUimContent->content[i] & 0x0F) >= 0x0A)
-                DeviceICCID[j++] = 'A' + (pUimContent->content[i] & 0x0F);
-            else
-                DeviceICCID[j++] = '0' + (pUimContent->content[i] & 0x0F);
+            char charmaps[] = "0123456789ABCDEF";
 
-            if (((pUimContent->content[i] & 0xF0) >> 0x04) >= 0x0A)
-                DeviceICCID[j++] = 'A' + ((pUimContent->content[i] & 0xF0) >> 0x04);
-            else
-                DeviceICCID[j++] = '0' + ((pUimContent->content[i] & 0xF0) >> 0x04);
+            DeviceICCID[j++] = charmaps[(pUimContent->content[i] & 0x0F)];
+            DeviceICCID[j++] = charmaps[((pUimContent->content[i] & 0xF0) >> 0x04)];
         }
         DeviceICCID[j] = '\0';
 
@@ -851,18 +916,7 @@ int requestGetIMSI(void) { //RIL_REQUEST_GET_IMSI
     } else {
         return 0;
     }
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     pUimContent = (PQMIUIM_CONTENT)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x11);
     if (pUimContent != NULL) {
@@ -959,18 +1013,7 @@ int requestGetHomeNetwork(USHORT *p_mcc, USHORT *p_mnc, USHORT *p_sid, USHORT *p
 
     pRequest = ComposeQMUXMsg(QMUX_TYPE_NAS, QMINAS_GET_HOME_NETWORK_REQ, NULL, NULL);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     pHomeNetwork = (PHOME_NETWORK)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x01);
     if (pHomeNetwork && p_mcc && p_mnc ) {
@@ -1015,24 +1058,24 @@ static const char * MCCMNC_CODES_HAVING_3DIGITS_MNC[] = {
 };
 
 static const char * MCC_CODES_HAVING_3DIGITS_MNC[] = {
-    "302",	//Canada
-    "310",	//United States of America
-    "311",	//United States of America
-    "312",	//United States of America
-    "313",	//United States of America
-    "314",	//United States of America
-    "315",	//United States of America
-    "316",	//United States of America
-    "334",	//Mexico
-    "338",	//Jamaica
+    "302",    //Canada
+    "310",    //United States of America
+    "311",    //United States of America
+    "312",    //United States of America
+    "313",    //United States of America
+    "314",    //United States of America
+    "315",    //United States of America
+    "316",    //United States of America
+    "334",    //Mexico
+    "338",    //Jamaica
     "342", //Barbados
-    "344",	//Antigua and Barbuda
-    "346",	//Cayman Islands
-    "348",	//British Virgin Islands
-    "365",	//Anguilla
-    "708",	//Honduras (Republic of)
-    "722",	//Argentine Republic
-    "732"	//Colombia (Republic of)
+    "344",    //Antigua and Barbuda
+    "346",    //Cayman Islands
+    "348",    //British Virgin Islands
+    "365",    //Anguilla
+    "708",    //Honduras (Republic of)
+    "722",    //Argentine Republic
+    "732"    //Colombia (Republic of)
 };
 
 int requestGetIMSI(const char **pp_imsi, USHORT *pMobileCountryCode, USHORT *pMobileNetworkCode) {
@@ -1047,18 +1090,7 @@ int requestGetIMSI(const char **pp_imsi, USHORT *pMobileCountryCode, USHORT *pMo
 
     pRequest = ComposeQMUXMsg(QMUX_TYPE_DMS, QMIDMS_UIM_GET_IMSI_REQ, NULL, NULL);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     if (pMUXMsg->UIMGetIMSIResp.TLV2Type == 0x01 &&  le16_to_cpu(pMUXMsg->UIMGetIMSIResp.TLV2Length) >= 5) {
         int mnc_len = 2;
@@ -1154,18 +1186,7 @@ int requestRegistrationState2(UCHAR *pPSAttachedState) {
     *pPSAttachedState = 0;
     pRequest = ComposeQMUXMsg(QMUX_TYPE_NAS, QMINAS_GET_SYS_INFO_REQ, NULL, NULL);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     pServiceStatusInfo = (PSERVICE_STATUS_INFO)(((PCHAR)&pMUXMsg->GetSysInfoResp) + QCQMUX_MSG_HDR_SIZE);
     remainingLen = le16_to_cpu(pMUXMsg->GetSysInfoResp.Length);
@@ -1518,18 +1539,7 @@ int requestRegistrationState(UCHAR *pPSAttachedState) {
 
     pRequest = ComposeQMUXMsg(QMUX_TYPE_NAS, QMINAS_GET_SERVING_SYSTEM_REQ, NULL, NULL);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     pCurrentPlmn = (PQMINAS_CURRENT_PLMN_MSG)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x12);
     if (pCurrentPlmn) {
@@ -1620,18 +1630,7 @@ int requestQueryDataCall(UCHAR  *pConnectionStatus, int curIpFamily) {
 
     pRequest = ComposeQMUXMsg(QMIType, QMIWDS_GET_PKT_SRVC_STATUS_REQ, NULL, NULL);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     *pConnectionStatus = QWDS_PKT_DATA_DISCONNECTED;
     pPktSrvc = (PQMIWDS_PKT_SRVC_TLV)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x01);
@@ -1669,39 +1668,13 @@ int requestSetupDataCall(PROFILE_T *profile, int curIpFamily) {
     PQCQMIMSG pResponse;
     PQMUX_MSG pMUXMsg;
     int err = 0;
-    int old_auth = profile->auth;
     UCHAR QMIType = (curIpFamily == IpFamilyV4) ? QMUX_TYPE_WDS : QMUX_TYPE_WDS_IPV6;
 
 //DualIPSupported means can get ipv4 & ipv6 address at the same time, one wds for ipv4, the other wds for ipv6
-__requestSetupDataCall:
     profile->curIpFamily = curIpFamily;
     pRequest = ComposeQMUXMsg(QMIType, QMIWDS_START_NETWORK_INTERFACE_REQ, WdsStartNwInterfaceReq, profile);
     err = QmiThreadSendQMITimeout(pRequest, &pResponse, 120 * 1000);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError))
-    {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-
-        if (curIpFamily == IpFamilyV4 && old_auth == profile->auth
-            && profile->user && profile->user[0] && profile->password && profile->password[0]) {
-            profile->auth = (profile->auth == 1) ? 2 : 1;
-            free(pResponse);
-            goto __requestSetupDataCall;
-        }
-
-        profile->auth = old_auth;
-
-        err = le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-        free(pResponse);
-        return err;
-    }
+    qmi_rsp_check_and_return();
 
     if (curIpFamily == IpFamilyV4) {
         WdsConnectionIPv4Handle = le32_to_cpu(pResponse->MUXMsg.StartNwInterfaceResp.Handle);
@@ -1730,18 +1703,7 @@ int requestDeactivateDefaultPDP(PROFILE_T *profile, int curIpFamily) {
 
     pRequest = ComposeQMUXMsg(QMIType, QMIWDS_STOP_NETWORK_INTERFACE_REQ , WdsStopNwInterfaceReq, &curIpFamily);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     if (curIpFamily == IpFamilyV4)
         WdsConnectionIPv4Handle = 0;
@@ -1775,18 +1737,7 @@ int requestGetIPAddress(PROFILE_T *profile, int curIpFamily) {
 
     pRequest = ComposeQMUXMsg(QMIType, QMIWDS_GET_RUNTIME_SETTINGS_REQ, WdsGetRuntimeSettingReq, NULL);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     pIpv4Addr = (PQMIWDS_GET_RUNTIME_SETTINGS_TLV_IPV4_ADDR)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, QMIWDS_GET_RUNTIME_SETTINGS_TLV_TYPE_IPV4PRIMARYDNS);
     if (pIpv4Addr) {
@@ -1857,18 +1808,7 @@ int requestSetProfile(PROFILE_T *profile) {
     dbg_time("%s[%d] %s/%s/%s/%d", __func__, profile->pdp, profile->apn, profile->user, profile->password, profile->auth);
     pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS, QMIWDS_MODIFY_PROFILE_SETTINGS_REQ, WdsModifyProfileSettingsReq, profile);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     free(pResponse);
     return 0;
@@ -1893,18 +1833,7 @@ int requestGetProfile(PROFILE_T *profile) {
 
     pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS, QMIWDS_GET_PROFILE_SETTINGS_REQ, WdsGetProfileSettingsReqSend, profile);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     pApnName = (PQMIWDS_APNNAME)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x14);
     pUserName = (PQMIWDS_USERNAME)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x1B);
@@ -1949,18 +1878,7 @@ int requestBaseBandVersion(const char **pp_reversion) {
 
     pRequest = ComposeQMUXMsg(QMUX_TYPE_DMS, QMIDMS_GET_DEVICE_REV_ID_REQ, NULL, NULL);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     revId = (PDEVICE_REV_ID)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x01);
 
@@ -2001,18 +1919,7 @@ int requestSetOperatingMode(UCHAR OperatingMode) {
     
     pRequest = ComposeQMUXMsg(QMUX_TYPE_DMS, QMIDMS_SET_OPERATING_MODE_REQ, DmsSetOperatingModeReq, &OperatingMode);
     err = QmiThreadSendQMI(pRequest, &pResponse);
-
-    if (err < 0 || pResponse == NULL) {
-        dbg_time("%s err = %d", __func__, err);
-        return err;
-    }
-
-    pMUXMsg = &pResponse->MUXMsg;
-    if (le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult) || le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError)) {
-        dbg_time("%s QMUXResult = 0x%x, QMUXError = 0x%x", __func__,
-            le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXResult), le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError));
-        return le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
-    }
+    qmi_rsp_check_and_return();
 
     free(pResponse);
     return 0;

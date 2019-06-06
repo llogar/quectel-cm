@@ -3,6 +3,8 @@
 #include <termios.h>
 #include <stdio.h>
 #include <ctype.h>
+typedef unsigned short sa_family_t;
+#include <linux/un.h>
 #include "QMIThread.h"
 
 #ifdef CONFIG_QMIWWAN
@@ -141,16 +143,37 @@ int QmiWwanInit(PROFILE_T *profile) {
     int ret;
     PQCQMIMSG pResponse;
 
-    for (i = 0; i < 10; i++) {
-        ret = QmiThreadSendQMITimeout(ComposeQCTLMsg(QMICTL_SYNC_REQ, NULL, NULL), NULL, 1 * 1000);
-        if (!ret)
-            break;
-        sleep(1);
+    if (profile->qmapnet_adapter == NULL || profile->qmapnet_adapter == profile->usbnet_adapter)
+    {
+        for (i = 0; i < 10; i++) {
+            ret = QmiThreadSendQMITimeout(ComposeQCTLMsg(QMICTL_SYNC_REQ, NULL, NULL), NULL, 1 * 1000);
+            if (!ret)
+                break;
+            sleep(1);
+        }
+        if (ret)
+            return ret;
     }
-    if (ret)
-        return ret;
 
     QmiThreadSendQMI(ComposeQCTLMsg(QMICTL_GET_VERSION_REQ, CtlGetVersionReq, NULL), &pResponse);
+    if (profile->qmapnet_adapter != NULL && profile->qmapnet_adapter == profile->usbnet_adapter) {
+        if (pResponse) {
+            if (pResponse->CTLMsg.QMICTLMsgHdrRsp.QMUXResult == 0 && pResponse->CTLMsg.QMICTLMsgHdrRsp.QMUXError == 0) {
+                uint8_t  NumElements = 0;
+
+                for (NumElements = 0; NumElements < pResponse->CTLMsg.GetVersionRsp.NumElements; NumElements++) {
+#if 0
+                    dbg_time("QMUXType = %02x Version = %d.%d",
+                        pResponse->CTLMsg.GetVersionRsp.TypeVersion[NumElements].QMUXType,
+                        pResponse->CTLMsg.GetVersionRsp.TypeVersion[NumElements].MajorVersion,
+                        pResponse->CTLMsg.GetVersionRsp.TypeVersion[NumElements].MinorVersion);
+#endif
+                    if (pResponse->CTLMsg.GetVersionRsp.TypeVersion[NumElements].QMUXType == QMUX_TYPE_WDS_ADMIN)
+                        profile->qmap_version = (pResponse->CTLMsg.GetVersionRsp.TypeVersion[NumElements].MinorVersion > 16);
+                }
+            }
+        }
+    }
     if (pResponse) free(pResponse);
     qmiclientId[QMUX_TYPE_WDS] = QmiWwanGetClientID(QMUX_TYPE_WDS);
     if (profile->IsDualIPSupported)
@@ -158,7 +181,9 @@ int QmiWwanInit(PROFILE_T *profile) {
     qmiclientId[QMUX_TYPE_DMS] = QmiWwanGetClientID(QMUX_TYPE_DMS);
     qmiclientId[QMUX_TYPE_NAS] = QmiWwanGetClientID(QMUX_TYPE_NAS);
     qmiclientId[QMUX_TYPE_UIM] = QmiWwanGetClientID(QMUX_TYPE_UIM);
-    qmiclientId[QMUX_TYPE_WDS_ADMIN] = QmiWwanGetClientID(QMUX_TYPE_WDS_ADMIN);
+    if (profile->qmapnet_adapter == NULL || profile->qmapnet_adapter == profile->usbnet_adapter)
+        qmiclientId[QMUX_TYPE_WDS_ADMIN] = QmiWwanGetClientID(QMUX_TYPE_WDS_ADMIN);
+
     return 0;
 }
 
@@ -176,16 +201,66 @@ int QmiWwanDeInit(void) {
     return 0;
 }
 
+#define QUECTEL_QMI_PROXY "quectel-qmi-proxy"
+static int qmi_proxy_open(const char *name) {
+    int sockfd = -1;
+    int reuse_addr = 1;
+    struct sockaddr_un sockaddr;
+    socklen_t alen;
+
+    /*Create server socket*/
+    (sockfd = socket(AF_LOCAL, SOCK_STREAM, 0));
+    if (sockfd < 0)
+        return sockfd;
+
+    memset(&sockaddr, 0, sizeof(sockaddr));
+    sockaddr.sun_family = AF_LOCAL;
+    sockaddr.sun_path[0] = 0;
+    memcpy(sockaddr.sun_path + 1, name, strlen(name) );
+
+    alen = strlen(name) + offsetof(struct sockaddr_un, sun_path) + 1;
+    if(connect(sockfd, (struct sockaddr *)&sockaddr, alen) < 0) {
+        close(sockfd);
+        dbg_time("%s connect %s errno: %d (%s)\n", __func__, name, errno, strerror(errno));
+        return -1;
+    }
+    (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr,sizeof(reuse_addr)));
+
+    dbg_time("connect to %s sockfd = %d\n", name, sockfd);
+
+    return sockfd;
+}
+
+static ssize_t qmi_proxy_read (int fd, void *buf, size_t size) {
+    ssize_t nreads;
+    PQCQMI_HDR pHdr = (PQCQMI_HDR)buf;
+
+    nreads = read(fd, pHdr, sizeof(QCQMI_HDR));
+    if (nreads == sizeof(QCQMI_HDR)) {
+        nreads += read(fd, pHdr+1, le16_to_cpu(pHdr->Length) + 1 - sizeof(QCQMI_HDR));
+    }
+
+    return nreads;
+}
+
 void * QmiWwanThread(void *pData) {
-    const char *cdc_wdm = (const char *)pData;
-    cdc_wdm_fd = open(cdc_wdm, O_RDWR | O_NONBLOCK | O_NOCTTY);
+    PROFILE_T *profile = (PROFILE_T *)pData;
+    const char *cdc_wdm = (const char *)profile->qmichannel;
+    
+    if (profile->qmapnet_adapter == NULL || profile->qmapnet_adapter == profile->usbnet_adapter)
+        cdc_wdm_fd = open(cdc_wdm, O_RDWR | O_NONBLOCK | O_NOCTTY);
+    else
+        cdc_wdm_fd = qmi_proxy_open(QUECTEL_QMI_PROXY);
+
     if (cdc_wdm_fd == -1) {
         dbg_time("%s Failed to open %s, errno: %d (%s)", __func__, cdc_wdm, errno, strerror(errno));
         qmidevice_send_event_to_main(RIL_INDICATE_DEVICE_DISCONNECTED);
         pthread_exit(NULL);
         return NULL;
     }
-    fcntl(cdc_wdm_fd, F_SETFD, FD_CLOEXEC) ;
+
+    fcntl(cdc_wdm_fd, F_SETFL, fcntl(cdc_wdm_fd,F_GETFL) | O_NONBLOCK);
+    fcntl(cdc_wdm_fd, F_SETFD, FD_CLOEXEC);
 
     dbg_time("cdc_wdm_fd = %d", cdc_wdm_fd);
 
@@ -246,8 +321,11 @@ void * QmiWwanThread(void *pData) {
                 ssize_t nreads;
                 UCHAR QMIBuf[512];
                 PQCQMIMSG pResponse = (PQCQMIMSG)QMIBuf;
-
-                nreads = read(fd, QMIBuf, sizeof(QMIBuf));
+                
+                if (profile->qmapnet_adapter == NULL || profile->qmapnet_adapter == profile->usbnet_adapter)
+                    nreads = read(fd, QMIBuf, sizeof(QMIBuf));
+                else
+                    nreads = qmi_proxy_read(fd, QMIBuf, sizeof(QMIBuf));
                 //dbg_time("%s read=%d errno: %d (%s)",  __func__, (int)nreads, errno, strerror(errno));
                 if (nreads <= 0) {
                     dbg_time("%s read=%d errno: %d (%s)",  __func__, (int)nreads, errno, strerror(errno));

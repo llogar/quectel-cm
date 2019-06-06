@@ -100,6 +100,9 @@ typedef struct __IPV6 {
 typedef struct __PROFILE {
     char * qmichannel;
     char * usbnet_adapter;
+    char * qmapnet_adapter;
+    int qmap_mode;
+    int qmap_version;
     const char *apn;
     const char *user;
     const char *password;
